@@ -168,7 +168,7 @@
         <div class="fstep-num">2</div>
         <div class="fstep-body">
           <div class="fstep-title">Flash unchanged firmware</div>
-          <div class="fstep-desc">Click below and select the <span class="code">RPI-RP2</span> drive. The browser writes the official firmware directly to the microcontroller.</div>
+          <div class="fstep-desc">Click below and select the <span class="code">RPI-RP2</span> drive. The browser writes the official firmware directly—there is no manual download or binary patching.</div>
           <div class="fstep-action">
             <button class="btn-primary" id="rpFlashBtn" disabled>⚡ Select RPI-RP2 &amp; flash</button>
             <div id="rpFlashStatus" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
@@ -222,8 +222,8 @@
       <div class="flash-step" id="esp_step2">
         <div class="fstep-num">2</div>
         <div class="fstep-body">
-          <div class="fstep-title">Build &amp; flash firmware</div>
-          <div class="fstep-desc">Patches your config into the firmware, then writes it to the board over serial. Takes about 30–60 seconds.</div>
+          <div class="fstep-title">Flash unchanged firmware</div>
+          <div class="fstep-desc">Writes the bootloader, partition table, boot application, and unchanged application image. Takes about 30–60 seconds.</div>
           <div class="fstep-action">
             <button class="btn-primary" id="espFlashBtn" disabled>⚡ Flash firmware</button>
             <div id="espFlashStatus" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
@@ -237,8 +237,9 @@
       <div class="flash-step" id="esp_step3">
         <div class="fstep-num">3</div>
         <div class="fstep-body">
-          <div class="fstep-title">Reset &amp; verify</div>
-          <div class="fstep-desc">Once flashing completes, the board resets automatically and boots your new firmware. Check the log below to confirm it's running.</div>
+          <div class="fstep-title">Save configuration to LittleFS</div>
+          <div class="fstep-desc">After the board restarts, the browser sends your configuration over USB serial. The firmware validates it, creates <span class="code">/config.json</span>, restarts, and verifies the saved file.</div>
+          <div id="espProvisionStatus" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
         </div>
       </div>
     </div>
@@ -294,7 +295,6 @@
     provisionRP2040,
     verifyRP2040Config,
   } from './js/rp2040-flasher.js?v=8';
-  import { patchEsp32Bin } from './js/patch-esp32-bin.js';
 
   const setup  = JSON.parse(sessionStorage.getItem('iotwx_setup') || '{}');
   const device = setup.device;
@@ -440,7 +440,7 @@
       return;
     }
 
-    bootselStatus.innerHTML = `<button class="btn-secondary" id="confirmBootsel">✓ RPI-RP2 is visible — Click to continue</button>`;
+    bootselStatus.innerHTML = `<button class="btn-secondary" id="confirmBootsel">✓ RPI-RP2 is visible — continue</button>`;
     document.getElementById('confirmBootsel').addEventListener('click', () => {
       setStatus(bootselStatus, 'ok', '✓ Board is in BOOTSEL mode');
       step1.classList.remove('active');
@@ -504,28 +504,7 @@
         );
 
         // Only wait here. Do not request a serial port automatically.
-        for (let remaining = 3; remaining > 0; remaining--) {
-          provisionBtn.disabled = true;
-          provisionBtn.innerHTML =
-            `<span class="spinner"></span> Board restarting… ${remaining}s`;
-
-          setStatus(
-            provisionStatus,
-            'wait',
-            `Waiting for the RP2040 serial device… ${remaining}s`
-          );
-
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-
-        provisionBtn.disabled = false;
-        provisionBtn.innerHTML = '🔌 Connect & save configuration';
-
-        setStatus(
-          provisionStatus,
-          'wait',
-          'Ready—click below and select the RP2040 serial device.'
-        );
+        await new Promise(resolve => setTimeout(resolve, 15000));
 
         provisionBtn.disabled = false;
 
@@ -663,38 +642,199 @@
     const flashStatus  = document.getElementById('espFlashStatus');
     const progressWrap = document.getElementById('espProgressWrap');
     const progressBar  = document.getElementById('espProgressBar');
+    const provisionStatus = document.getElementById('espProvisionStatus');
+
+    const ESP32_FIRMWARE_IMAGES = Object.freeze([
+      { url: 'firmware/mesonet_esp32_bootloader.bin', address: 0x1000 },
+      { url: 'firmware/mesonet_esp32_partitions.bin', address: 0x8000 },
+      { url: 'firmware/mesonet_esp32_boot_app0.bin',  address: 0xE000 },
+      { url: 'firmware/mesonet_esp32.bin',            address: 0x10000 },
+    ]);
+
+    const delay = milliseconds =>
+      new Promise(resolve => setTimeout(resolve, milliseconds));
+
+    function toBinaryString(bytes) {
+      let result = '';
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        result += String.fromCharCode.apply(
+          null,
+          bytes.subarray(offset, offset + chunkSize)
+        );
+      }
+      return result;
+    }
+
+    async function fetchEsp32Images() {
+      const cacheBuster = Date.now();
+
+      return Promise.all(ESP32_FIRMWARE_IMAGES.map(async image => {
+        const response = await fetch(`${image.url}?v=${cacheBuster}`, {
+          cache: 'no-store',
+        });
+
+        if (!response.ok) {
+          throw new Error(`Firmware file not found (${response.status}): ${image.url}`);
+        }
+
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length === 0) {
+          throw new Error(`Firmware file is empty: ${image.url}`);
+        }
+
+        return {
+          data: toBinaryString(bytes),
+          address: image.address,
+          size: bytes.length,
+        };
+      }));
+    }
+
+    function buildEsp32ProvisioningConfig(source) {
+      const document = {
+        iotwx_id: String(source.id ?? ''),
+        iotwx_topic: String(source.topic ?? ''),
+        iotwx_wifi_ssid: String(source.wifi_ssid ?? ''),
+        iotwx_wifi_pwd: String(source.wifi_pwd ?? ''),
+        iotwx_mq_ip: String(source.mq_ip ?? ''),
+        iotwx_mq_port: String(source.mq_port ?? '1883'),
+        iotwx_use_wifi: String(source.use_wifi ?? '1'),
+        iotwx_publish_interval: String(source.publish_interval ?? '2'),
+        iotwx_reset_interval: String(source.reset_interval ?? '360'),
+        iotwx_timezone: String(source.timezone ?? '21600'),
+        iotwx_gpio_config: String(source.gpio_config ?? 'A'),
+        iotwx_max_frequency: String(source.max_frequency ?? '80'),
+        iotwx_aspiration_spinup_time: String(source.aspiration_time ?? '10'),
+        iotwx_sensor: 'grove/i2c',
+        iotwx_local_config: '1',
+      };
+
+      const command = `IOTWX_CONFIG ${JSON.stringify(document)}\n`;
+      if (new TextEncoder().encode(command).byteLength > 2048) {
+        throw new Error('The complete ESP32 configuration exceeds 2048 bytes.');
+      }
+
+      return { document, command };
+    }
+
+    async function openEsp32SerialPort(port, baudRate = 115200) {
+      let lastError;
+
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          await port.open({ baudRate });
+          try {
+            await port.setSignals({
+              dataTerminalReady: false,
+              requestToSend: false,
+            });
+          } catch (signalError) {
+            espLog(`Warning: could not release DTR/RTS (${signalError.message})`, 'serial-line-warn');
+          }
+          return;
+        } catch (error) {
+          lastError = error;
+          await delay(300);
+        }
+      }
+
+      throw new Error(`Could not reopen the ESP32 serial port: ${lastError?.message || 'unknown error'}`);
+    }
+
+    async function waitForEsp32Response(reader, state, expected, timeoutMs) {
+      let timeoutId;
+      const timeout = new Promise((resolve, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error(`Timed out waiting for ${expected}.`)),
+          timeoutMs
+        );
+      });
+
+      try {
+        while (true) {
+          const { value, done } = await Promise.race([reader.read(), timeout]);
+          if (done) throw new Error('The ESP32 serial connection closed unexpectedly.');
+
+          state.buffer += state.decoder.decode(value, { stream: true });
+          const lines = state.buffer.split(/\r?\n/);
+          state.buffer = lines.pop() || '';
+
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            espLog(line);
+
+            if (line.startsWith('IOTWX_CONFIG_ERROR')) {
+              throw new Error(`The ESP32 rejected the configuration: ${line}`);
+            }
+            if (line === expected) return line;
+          }
+        }
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    async function provisionEsp32(port, sourceConfig) {
+      const { command } = buildEsp32ProvisioningConfig(sourceConfig);
+      await openEsp32SerialPort(port);
+
+      const writer = port.writable.getWriter();
+      const reader = port.readable.getReader();
+      const encoder = new TextEncoder();
+      const state = { decoder: new TextDecoder(), buffer: '' };
+
+      try {
+        await writer.write(encoder.encode(command));
+        espLog('[sent configuration to device]');
+        await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_OK', 15000);
+
+        espLog('[info]: Device accepted configuration and is rebooting');
+
+        // The firmware waits 500 ms before ESP.restart(). Two seconds places
+        // this request safely inside its five-second post-boot status window.
+        await delay(2000);
+        await writer.write(encoder.encode('IOTWX_CONFIG_STATUS\n'));
+        espLog('[sent configuration status request]');
+        await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_LOADED', 10000);
+      } finally {
+        try { writer.releaseLock(); } catch (error) {}
+        try { await reader.cancel(); } catch (error) {}
+        try { reader.releaseLock(); } catch (error) {}
+        try { await port.close(); } catch (error) {}
+      }
+    }
 
     flashBtn.addEventListener('click', async () => {
       if (!esploader) { alert('Connect the device first.'); return; }
 
       flashBtn.disabled = true;
-      flashBtn.innerHTML = `<span class="spinner"></span> Building…`;
-      flashStatus.textContent = 'Patching firmware with your config…';
+      flashBtn.innerHTML = `<span class="spinner"></span> Loading firmware…`;
+      flashStatus.textContent = 'Loading unchanged firmware images…';
+      provisionStatus.textContent = '';
 
       try {
-        const resp = await fetch('firmware/mesonet_esp32.bin?v=' + Date.now());
-        if (!resp.ok) throw new Error(`Firmware not found (${resp.status})`);
-        const fwBuf = await resp.arrayBuffer();
-        const patchedBuf = await patchEsp32Bin(fwBuf, config);
-
-        const u8 = new Uint8Array(patchedBuf);
-        let binStr = '';
-        const CHUNK = 0x8000;
-        for (let i = 0; i < u8.length; i += CHUNK) {
-          binStr += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
-        }
+        const images = await fetchEsp32Images();
+        const totalBytes = images.reduce((sum, image) => sum + image.size, 0);
+        const completedBefore = images.map((_, index) =>
+          images.slice(0, index).reduce((sum, image) => sum + image.size, 0)
+        );
 
         flashBtn.innerHTML = `<span class="spinner"></span> Flashing…`;
-        flashStatus.textContent = 'Writing to flash — do not disconnect the board…';
+        flashStatus.textContent = 'Writing the complete flash layout — do not disconnect…';
         progressWrap.style.display = 'block';
 
         await esploader.writeFlash({
-          fileArray: [{ data: binStr, address: 0x10000 }],
+          fileArray: images.map(({ data, address }) => ({ data, address })),
           flashSize: 'keep',
-          eraseAll: false,
+          // A clean install prevents an old or incompatible filesystem from
+          // being mistaken for the configuration supplied in this session.
+          eraseAll: true,
           compress: true,
           reportProgress: (fileIndex, written, total) => {
-            const pct = Math.round((written / total) * 100);
+            const overallWritten = completedBefore[fileIndex] + written;
+            const pct = Math.min(100, Math.round((overallWritten / totalBytes) * 100));
             progressBar.style.width = pct + '%';
             flashStatus.textContent = `Writing to flash… ${pct}%`;
           },
@@ -736,15 +876,22 @@
           }
         }
 
-        if (released) {
-          espLog('Port released — auto-connecting Serial Monitor…');
-        } else {
-          espLog('Port may still be locked — attempting to auto-connect anyway…', 'serial-line-warn');
+        if (!released) {
+          throw new Error('The flashing port could not be released for configuration.');
         }
-        autoConnectMonitorWithRetry();
+
+        provisionStatus.innerHTML = `<span class="status-badge badge-wait">⏳ Saving configuration to LittleFS…</span>`;
+        espLog('[info]: Reconnecting for LittleFS configuration');
+        await provisionEsp32(device, config);
+
+        provisionStatus.innerHTML = `<span class="status-badge badge-ok">✓ Configuration saved and verified</span>`;
+        step3.classList.remove('active');
+        step3.classList.add('complete');
+        espLog('[info]: Device confirmed /config.json after reboot');
 
       } catch (e) {
-        flashStatus.innerHTML = `<span class="status-badge badge-err">✗ ${e.message}</span>`;
+        const target = step3.classList.contains('active') ? provisionStatus : flashStatus;
+        target.innerHTML = `<span class="status-badge badge-err">✗ ${e.message}</span>`;
         flashBtn.disabled = false;
         flashBtn.innerHTML = `⚡ Flash firmware`;
         espLog(`Error: ${e.message}`, 'serial-line-error');
