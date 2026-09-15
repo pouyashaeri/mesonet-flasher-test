@@ -251,12 +251,42 @@
       </div>
     </div>
 
-    <div class="how-to">
-      <h3>Viewing boot output</h3>
-      <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;">
-        <img src="assets/atomlite.jpg" alt="Reset button location on M5Stack Atom Lite" style="border-radius:6px;border:1px solid var(--border);width:140px;height:auto;object-fit:cover;flex-shrink:0;" />
-        <p style="font-size:13px;color:var(--muted);line-height:1.5;flex:1;min-width:200px;">
-          The Serial Monitor connects automatically after flashing, but the board's first boot usually finishes printing before the connection is ready. Press the <strong style="color:var(--text);">reset button</strong> on the Atom Lite (shown here) to trigger a fresh boot and see the full log below.
+    <div class="how-to" id="atomBootHelp">
+      <h3>Optional: View the complete boot output</h3>
+
+      <div style="
+        display:flex;
+        gap:24px;
+        align-items:flex-start;
+        flex-wrap:wrap;
+      ">
+        <img
+          src="assets/atomlite.jpg"
+          alt="Reset button location on M5Stack Atom Lite"
+          style="
+            border-radius:6px;
+            border:1px solid var(--border);
+            width:320px;
+            max-width:100%;
+            height:auto;
+            flex-shrink:0;
+          "
+        />
+
+        <p style="
+          font-size:13px;
+          color:var(--muted);
+          line-height:1.6;
+          flex:1;
+          min-width:220px;
+          margin:0;
+        ">
+          <strong style="color:var(--text);">This step is not required for flashing or configuration.</strong>
+          The Atom Lite restarts automatically after saving the configuration.
+          If you want to inspect the complete startup log for troubleshooting,
+          press the <strong style="color:var(--text);">reset button</strong> shown
+          in the image. This will restart the board without erasing the firmware
+          or the saved <span class="code">/config.json</span>.
         </p>
       </div>
     </div>
@@ -364,6 +394,7 @@
       </div>`;
     document.getElementById('esp32Flow').classList.add('active');
     if (isGenericEsp32CamTest) {
+      document.getElementById('atomBootHelp').style.display = 'none';
       document.getElementById('espConnectInstructions').innerHTML =
         'Connect the ESP32-CAM through its USB programmer or USB-to-UART adapter. ' +
         'With a basic adapter, connect <span class="code">GPIO0</span> to GND and reset the board before connecting.';
