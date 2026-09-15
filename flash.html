@@ -211,7 +211,7 @@
         <div class="fstep-num">1</div>
         <div class="fstep-body">
           <div class="fstep-title">Connect your board</div>
-          <div class="fstep-desc">Plug the Atom Lite in via USB-C. No BOOTSEL button needed — the browser resets it into flashing mode automatically.</div>
+          <div class="fstep-desc" id="espConnectInstructions">Plug the Atom Lite in via USB-C. No BOOTSEL button needed — the browser resets it into flashing mode automatically.</div>
           <div class="fstep-action">
             <button class="btn-primary" id="espConnectBtn">🔌 Connect device</button>
             <div id="espConnectStatus" style="margin-top:10px;font-size:13px;"></div>
@@ -303,6 +303,9 @@
   const isGenericRp2040Test =
     new URLSearchParams(window.location.search).get('rp2040') === 'generic';
 
+  const isGenericEsp32CamTest =
+    new URLSearchParams(window.location.search).get('esp32') === 'generic';
+
   const rp2040FirmwareUrl = isGenericRp2040Test
     ? 'firmware/generic_rp2040_test.uf2'
     : 'firmware/mesonet_rp2040.uf2';
@@ -342,9 +345,15 @@
     document.getElementById('rp2040Flow').classList.add('active');
     initRp2040Flow();
   } else if (device === 'esp32') {
-    pageSub.textContent = 'Connect over USB and flash directly from this page — no drivers needed.';
+    pageSub.textContent = isGenericEsp32CamTest
+      ? 'Test unchanged ESP32 firmware flashing and LittleFS configuration on an ESP32-CAM.'
+      : 'Flash unchanged firmware, then save your configuration separately in LittleFS.';
     summaryEl.innerHTML = `
-      <span class="device-badge">📶 ESP32 Atom Lite</span>
+      <span class="device-badge">${
+        isGenericEsp32CamTest
+          ? '🧪 Generic ESP32-CAM test'
+          : '📶 ESP32 Atom Lite'
+      }</span>
       <div class="config-card">
         <div class="config-dot"></div>
         <div class="config-info">
@@ -354,6 +363,11 @@
         <a href="index.html" class="config-edit">Edit →</a>
       </div>`;
     document.getElementById('esp32Flow').classList.add('active');
+    if (isGenericEsp32CamTest) {
+      document.getElementById('espConnectInstructions').innerHTML =
+        'Connect the ESP32-CAM through its USB programmer or USB-to-UART adapter. ' +
+        'With a basic adapter, connect <span class="code">GPIO0</span> to GND and reset the board before connecting.';
+    }
     initEsp32Flow();
   }
 
@@ -644,11 +658,15 @@
     const progressBar  = document.getElementById('espProgressBar');
     const provisionStatus = document.getElementById('espProvisionStatus');
 
+    const esp32FirmwareBase = isGenericEsp32CamTest
+      ? 'firmware/generic_esp32cam_test'
+      : 'firmware/mesonet_esp32';
+
     const ESP32_FIRMWARE_IMAGES = Object.freeze([
-      { url: 'firmware/mesonet_esp32_bootloader.bin', address: 0x1000 },
-      { url: 'firmware/mesonet_esp32_partitions.bin', address: 0x8000 },
-      { url: 'firmware/mesonet_esp32_boot_app0.bin',  address: 0xE000 },
-      { url: 'firmware/mesonet_esp32.bin',            address: 0x10000 },
+      { url: `${esp32FirmwareBase}_bootloader.bin`, address: 0x1000 },
+      { url: `${esp32FirmwareBase}_partitions.bin`, address: 0x8000 },
+      { url: `${esp32FirmwareBase}_boot_app0.bin`,  address: 0xE000 },
+      { url: `${esp32FirmwareBase}.bin`,            address: 0x10000 },
     ]);
 
     const delay = milliseconds =>
@@ -786,6 +804,13 @@
       const state = { decoder: new TextDecoder(), buffer: '' };
 
       try {
+        // Opening the FTDI port can reset the ESP32. Do not transmit while
+        // the ROM bootloader and application are still starting, or the
+        // beginning of IOTWX_CONFIG may be lost and interpreted as an
+        // unknown command.
+        espLog('[info]: Waiting for ESP32 provisioning firmware to become ready');
+        await delay(2500);
+
         await writer.write(encoder.encode(command));
         espLog('[sent configuration to device]');
         await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_OK', 15000);
@@ -878,6 +903,18 @@
 
         if (!released) {
           throw new Error('The flashing port could not be released for configuration.');
+        }
+
+        if (isGenericEsp32CamTest) {
+          provisionStatus.innerHTML = `<span class="status-badge badge-wait">Waiting for the ESP32-CAM to start normally…</span>`;
+          const ready = window.confirm(
+            'ESP32-CAM test: if GPIO0 is connected to GND, remove that jumper now. ' +
+            'Press RESET so the board starts the new firmware, then click OK.'
+          );
+          if (!ready) {
+            throw new Error('ESP32-CAM restart confirmation was cancelled.');
+          }
+          await delay(500);
         }
 
         provisionStatus.innerHTML = `<span class="status-badge badge-wait">⏳ Saving configuration to LittleFS…</span>`;
