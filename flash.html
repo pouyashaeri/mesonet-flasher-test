@@ -239,9 +239,12 @@
         <div class="fstep-body">
           <div class="fstep-title">Save configuration to LittleFS</div>
           <div class="fstep-desc">After the board restarts, the browser sends your configuration over USB serial. The firmware validates it, creates <span class="code">/config.json</span>, restarts, and verifies the saved file.</div>
-          <div class="fstep-action">
-            <button class="btn-primary" id="espRetryProvisionBtn">Save configuration without flashing again</button>
-          </div>
+          <details id="espProvisionRecovery" style="margin-top:12px;">
+            <summary style="font-size:12px;color:var(--muted);cursor:pointer;">Already flashed? Retry configuration</summary>
+            <div class="fstep-action">
+              <button class="btn-secondary" id="espRetryProvisionBtn">Connect & save configuration</button>
+            </div>
+          </details>
           <div id="espProvisionStatus" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
         </div>
       </div>
@@ -692,8 +695,7 @@
     const progressBar  = document.getElementById('espProgressBar');
     const provisionStatus = document.getElementById('espProvisionStatus');
     const retryProvisionBtn = document.getElementById('espRetryProvisionBtn');
-    // A previously flashed board can be configured after a page reload.
-    step3.classList.add('active');
+    const provisionRecovery = document.getElementById('espProvisionRecovery');
 
     const esp32FirmwareBase = isGenericEsp32CamTest
       ? 'firmware/generic_esp32cam_test'
@@ -920,10 +922,13 @@
         provisionStatus.textContent = 'Connecting to the firmware…';
         await provisionEsp32(device, config);
         provisionStatus.innerHTML = '<span class="status-badge badge-ok">✓ Configuration saved and verified</span>';
+        step3.classList.remove('active');
         step3.classList.add('complete');
-        retryProvisionBtn.hidden = true;
+        provisionRecovery.hidden = true;
       } catch (error) {
         provisionStatus.textContent = `Configuration failed: ${error.message}`;
+        provisionRecovery.hidden = false;
+        provisionRecovery.open = true;
         espLog(`Error: ${error.message}`, 'serial-line-error');
       } finally {
         retryProvisionBtn.disabled = false;
@@ -938,6 +943,9 @@
       flashBtn.innerHTML = `<span class="spinner"></span> Loading firmware…`;
       flashStatus.textContent = 'Loading unchanged firmware images…';
       provisionStatus.textContent = '';
+      progressBar.style.width = '0%';
+      provisionRecovery.hidden = true;
+      provisionRecovery.open = false;
 
       let firmwareWritten = false;
       try {
@@ -966,6 +974,9 @@
           },
         });
         firmwareWritten = true;
+        // The flashing promise has completed, even if the progress callback
+        // stopped short of the final byte while esptool finished its cleanup.
+        progressBar.style.width = '100%';
 
         flashStatus.innerHTML = `<span class="status-badge badge-ok">✓ Flash complete</span>`;
         flashBtn.innerHTML = `✓ Flashed`;
@@ -1026,7 +1037,7 @@
         provisionStatus.innerHTML = `<span class="status-badge badge-ok">✓ Configuration saved and verified</span>`;
         step3.classList.remove('active');
         step3.classList.add('complete');
-        retryProvisionBtn.hidden = true;
+        provisionRecovery.hidden = true;
         espLog('[info]: Device confirmed /config.json after reboot');
 
       } catch (e) {
@@ -1035,6 +1046,8 @@
         flashBtn.disabled = firmwareWritten;
         if (!firmwareWritten) flashBtn.innerHTML = `⚡ Flash firmware`;
         retryProvisionBtn.disabled = !firmwareWritten;
+        provisionRecovery.hidden = !firmwareWritten;
+        provisionRecovery.open = firmwareWritten;
         espLog(`Error: ${e.message}`, 'serial-line-error');
       }
     });
