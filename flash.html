@@ -211,7 +211,7 @@
         <div class="fstep-num">1</div>
         <div class="fstep-body">
           <div class="fstep-title">Connect your board</div>
-          <div class="fstep-desc" id="espConnectInstructions">Plug the Atom Lite in via USB-C. No BOOTSEL button needed — the browser resets it into flashing mode automatically.</div>
+          <div class="fstep-desc" id="espConnectInstructions">Plug the Atom Lite in via USB-C.</div>
           <div class="fstep-action">
             <button class="btn-primary" id="espConnectBtn">🔌 Connect device</button>
             <div id="espConnectStatus" style="margin-top:10px;font-size:13px;"></div>
@@ -239,6 +239,9 @@
         <div class="fstep-body">
           <div class="fstep-title">Save configuration to LittleFS</div>
           <div class="fstep-desc">After the board restarts, the browser sends your configuration over USB serial. The firmware validates it, creates <span class="code">/config.json</span>, restarts, and verifies the saved file.</div>
+          <div class="fstep-action">
+            <button class="btn-primary" id="espRetryProvisionBtn">Save configuration without flashing again</button>
+          </div>
           <div id="espProvisionStatus" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
         </div>
       </div>
@@ -688,6 +691,9 @@
     const progressWrap = document.getElementById('espProgressWrap');
     const progressBar  = document.getElementById('espProgressBar');
     const provisionStatus = document.getElementById('espProvisionStatus');
+    const retryProvisionBtn = document.getElementById('espRetryProvisionBtn');
+    // A previously flashed board can be configured after a page reload.
+    step3.classList.add('active');
 
     const esp32FirmwareBase = isGenericEsp32CamTest
       ? 'firmware/generic_esp32cam_test'
@@ -792,32 +798,31 @@
     }
 
     async function waitForEsp32Response(reader, state, expected, timeoutMs) {
+      const responses = Array.isArray(expected) ? expected : [expected];
       let timeoutId;
       const timeout = new Promise((resolve, reject) => {
         timeoutId = setTimeout(
-          () => reject(new Error(`Timed out waiting for ${expected}.`)),
+          () => reject(new Error(`Timed out waiting for ${responses.join(' or ')}.`)),
           timeoutMs
         );
       });
 
       try {
         while (true) {
-          const { value, done } = await Promise.race([reader.read(), timeout]);
-          if (done) throw new Error('The ESP32 serial connection closed unexpectedly.');
-
-          state.buffer += state.decoder.decode(value, { stream: true });
-          const lines = state.buffer.split(/\r?\n/);
-          state.buffer = lines.pop() || '';
-
-          for (const rawLine of lines) {
-            const line = rawLine.trim();
-            if (!line) continue;
-            espLog(line);
-
-            if (line.startsWith('IOTWX_CONFIG_ERROR')) {
-              throw new Error(`The ESP32 rejected the configuration: ${line}`);
-            }
-            if (line === expected) return line;
+          if (state.lines.length === 0) {
+            const { value, done } = await Promise.race([reader.read(), timeout]);
+            if (done) throw new Error('The ESP32 serial connection closed unexpectedly.');
+            state.buffer += state.decoder.decode(value, { stream: true });
+            const lines = state.buffer.split(/\r?\n/);
+            state.buffer = lines.pop() || '';
+            state.lines.push(...lines);
+          }
+          const line = state.lines.shift().trim();
+          if (!line) continue;
+          espLog(line);
+          if (responses.includes(line)) return line;
+          if (line.startsWith('IOTWX_CONFIG_ERROR')) {
+            throw new Error(`The ESP32 rejected the configuration: ${line}`);
           }
         }
       } finally {
@@ -832,15 +837,18 @@
       const writer = port.writable.getWriter();
       const reader = port.readable.getReader();
       const encoder = new TextEncoder();
-      const state = { decoder: new TextDecoder(), buffer: '' };
+      const state = { decoder: new TextDecoder(), buffer: '', lines: [] };
 
       try {
-        // Opening the FTDI port can reset the ESP32. Do not transmit while
-        // the ROM bootloader and application are still starting, or the
-        // beginning of IOTWX_CONFIG may be lost and interpreted as an
-        // unknown command.
-        espLog('[info]: Waiting for ESP32 provisioning firmware to become ready');
-        await delay(2500);
+        // A port open can reset the board. A status query confirms that the
+        // application is receiving commands before any configuration is sent.
+        espLog('[info]: Checking whether the ESP32 is ready for configuration');
+        await delay(1500);
+        await writer.write(encoder.encode('IOTWX_CONFIG_STATUS\n'));
+        await waitForEsp32Response(reader, state, [
+          'IOTWX_CONFIG_ERROR NOT_LOADED',
+          'IOTWX_CONFIG_LOADED',
+        ], 15000);
 
         await writer.write(encoder.encode(command));
         espLog('[sent configuration to device]');
@@ -848,9 +856,8 @@
 
         espLog('[info]: Device accepted configuration and is rebooting');
 
-        // The firmware waits 500 ms before ESP.restart(). Two seconds places
-        // this request safely inside its five-second post-boot status window.
-        await delay(2000);
+        // Wait for the firmware's next startup before requesting verification.
+        await waitForEsp32Response(reader, state, 'IOTWX_PROVISION_READY', 15000);
         await writer.write(encoder.encode('IOTWX_CONFIG_STATUS\n'));
         espLog('[sent configuration status request]');
         await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_LOADED', 10000);
@@ -862,10 +869,29 @@
       }
     }
 
+    retryProvisionBtn.addEventListener('click', async () => {
+      retryProvisionBtn.disabled = true;
+      try {
+        // requestPort must run in this click handler when the page was reloaded.
+        if (!device) device = await navigator.serial.requestPort();
+        provisionStatus.textContent = 'Connecting to the firmware…';
+        await provisionEsp32(device, config);
+        provisionStatus.innerHTML = '<span class="status-badge badge-ok">✓ Configuration saved and verified</span>';
+        step3.classList.add('complete');
+        retryProvisionBtn.hidden = true;
+      } catch (error) {
+        provisionStatus.textContent = `Configuration failed: ${error.message}`;
+        espLog(`Error: ${error.message}`, 'serial-line-error');
+      } finally {
+        retryProvisionBtn.disabled = false;
+      }
+    });
+
     flashBtn.addEventListener('click', async () => {
       if (!esploader) { alert('Connect the device first.'); return; }
 
       flashBtn.disabled = true;
+      retryProvisionBtn.disabled = true;
       flashBtn.innerHTML = `<span class="spinner"></span> Loading firmware…`;
       flashStatus.textContent = 'Loading unchanged firmware images…';
       provisionStatus.textContent = '';
@@ -955,6 +981,7 @@
         provisionStatus.innerHTML = `<span class="status-badge badge-ok">✓ Configuration saved and verified</span>`;
         step3.classList.remove('active');
         step3.classList.add('complete');
+        retryProvisionBtn.hidden = true;
         espLog('[info]: Device confirmed /config.json after reboot');
 
       } catch (e) {
@@ -962,6 +989,7 @@
         target.innerHTML = `<span class="status-badge badge-err">✗ ${e.message}</span>`;
         flashBtn.disabled = false;
         flashBtn.innerHTML = `⚡ Flash firmware`;
+        retryProvisionBtn.disabled = false;
         espLog(`Error: ${e.message}`, 'serial-line-error');
       }
     });
