@@ -817,6 +817,7 @@
             state.buffer = lines.pop() || '';
             state.lines.push(...lines);
           }
+          if (state.lines.length === 0) continue;
           const line = state.lines.shift().trim();
           if (!line) continue;
           espLog(line);
