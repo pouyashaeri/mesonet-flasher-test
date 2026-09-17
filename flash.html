@@ -858,8 +858,20 @@
             .catch(error => { probeError = error; })
             .finally(() => { pendingProbe = null; });
         }
-        probe();
-        const probeTimer = setInterval(probe, 1000);
+        // On the ESP32-CAM the user has just reset the board. Give its READY
+        // message time to arrive before probing: a status command sent during
+        // boot can be truncated and later produce UNKNOWN_COMMAND.
+        let probeTimer = null;
+        const firstProbeTimer = isGenericEsp32CamTest
+          ? setTimeout(() => {
+              probe();
+              probeTimer = setInterval(probe, 1000);
+            }, 3000)
+          : null;
+        if (!isGenericEsp32CamTest) {
+          probe();
+          probeTimer = setInterval(probe, 1000);
+        }
         let resetPromise = null;
         // If the Atom Lite does not reply, reboot it into normal application
         // mode using RTS while DTR stays released. The reader is already open.
@@ -886,7 +898,8 @@
           ], 30000);
         } finally {
           if (resetTimer !== null) clearTimeout(resetTimer);
-          clearInterval(probeTimer);
+          if (firstProbeTimer !== null) clearTimeout(firstProbeTimer);
+          if (probeTimer !== null) clearInterval(probeTimer);
           if (resetPromise) await resetPromise;
           if (pendingProbe) await pendingProbe;
         }
@@ -895,9 +908,12 @@
         await writer.write(encoder.encode(command));
         espLog('[sent configuration to device]');
         // If READY arrived before the status reply, that older reply can
-        // appear here; it does not reject the configuration write.
+        // appear here. A truncated probe from boot may also yield
+        // UNKNOWN_COMMAND. Neither is proof that the configuration write was
+        // rejected; require its own OK response before claiming success.
         await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_OK', 15000,
-          ['IOTWX_CONFIG_ERROR NOT_LOADED', 'IOTWX_CONFIG_LOADED']);
+          ['IOTWX_CONFIG_ERROR NOT_LOADED', 'IOTWX_CONFIG_LOADED',
+            'IOTWX_CONFIG_ERROR UNKNOWN_COMMAND']);
 
         espLog('[info]: Device accepted configuration and is rebooting');
 
