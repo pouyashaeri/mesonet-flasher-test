@@ -797,7 +797,7 @@
       throw new Error(`Could not reopen the ESP32 serial port: ${lastError?.message || 'unknown error'}`);
     }
 
-    async function waitForEsp32Response(reader, state, expected, timeoutMs) {
+    async function waitForEsp32Response(reader, state, expected, timeoutMs, ignoredErrors = []) {
       const responses = Array.isArray(expected) ? expected : [expected];
       let timeoutId;
       const timeout = new Promise((resolve, reject) => {
@@ -817,12 +817,15 @@
             state.buffer = lines.pop() || '';
             state.lines.push(...lines);
           }
+          // A USB serial read can end in the middle of a line.
           if (state.lines.length === 0) continue;
           const line = state.lines.shift().trim();
           if (!line) continue;
           espLog(line);
-          if (responses.includes(line)) return line;
-          if (line.startsWith('IOTWX_CONFIG_ERROR')) {
+          const matched = responses.find(response => line.includes(response));
+          if (matched) return matched;
+          if (ignoredErrors.some(error => line.includes(error))) continue;
+          if (line.includes('IOTWX_CONFIG_ERROR')) {
             throw new Error(`The ESP32 rejected the configuration: ${line}`);
           }
         }
@@ -841,19 +844,58 @@
       const state = { decoder: new TextDecoder(), buffer: '', lines: [] };
 
       try {
-        // A port open can reset the board. A status query confirms that the
-        // application is receiving commands before any configuration is sent.
-        espLog('[info]: Checking whether the ESP32 is ready for configuration');
-        await delay(1500);
-        await writer.write(encoder.encode('IOTWX_CONFIG_STATUS\n'));
-        await waitForEsp32Response(reader, state, [
-          'IOTWX_CONFIG_ERROR NOT_LOADED',
-          'IOTWX_CONFIG_LOADED',
-        ], 15000);
+        // Listen while probing. A boot message may already have passed before
+        // the browser opened the port, so also ask the firmware for status.
+        espLog('[info]: Waiting for ESP32 provisioning firmware');
+        const statusRequest = encoder.encode('IOTWX_CONFIG_STATUS\n');
+        let pendingProbe = null;
+        let probeError = null;
+        function probe() {
+          if (pendingProbe) return;
+          pendingProbe = writer.write(statusRequest)
+            .catch(error => { probeError = error; })
+            .finally(() => { pendingProbe = null; });
+        }
+        probe();
+        const probeTimer = setInterval(probe, 1000);
+        let resetPromise = null;
+        // If the Atom Lite does not reply, reboot it into normal application
+        // mode using RTS while DTR stays released. The reader is already open.
+        const resetTimer = isGenericEsp32CamTest ? null : setTimeout(() => {
+          resetPromise = (async () => {
+            espLog('[info]: Restarting Atom Lite to enter provisioning mode');
+            try {
+              await port.setSignals({ dataTerminalReady: false, requestToSend: true });
+              await delay(120);
+              await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+            } catch (signalError) {
+              espLog(`[warn]: Automatic reset unavailable: ${signalError.message}`);
+              try {
+                await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+              } catch (releaseError) {}
+            }
+          })();
+        }, 3000);
+        try {
+          await waitForEsp32Response(reader, state, [
+            'IOTWX_PROVISION_READY',
+            'IOTWX_CONFIG_ERROR NOT_LOADED',
+            'IOTWX_CONFIG_LOADED',
+          ], 30000);
+        } finally {
+          if (resetTimer !== null) clearTimeout(resetTimer);
+          clearInterval(probeTimer);
+          if (resetPromise) await resetPromise;
+          if (pendingProbe) await pendingProbe;
+        }
+        if (probeError) throw probeError;
 
         await writer.write(encoder.encode(command));
         espLog('[sent configuration to device]');
-        await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_OK', 15000);
+        // If READY arrived before the status reply, that older reply can
+        // appear here; it does not reject the configuration write.
+        await waitForEsp32Response(reader, state, 'IOTWX_CONFIG_OK', 15000,
+          ['IOTWX_CONFIG_ERROR NOT_LOADED', 'IOTWX_CONFIG_LOADED']);
 
         espLog('[info]: Device accepted configuration and is rebooting');
 
@@ -897,6 +939,7 @@
       flashStatus.textContent = 'Loading unchanged firmware images…';
       provisionStatus.textContent = '';
 
+      let firmwareWritten = false;
       try {
         const images = await fetchEsp32Images();
         const totalBytes = images.reduce((sum, image) => sum + image.size, 0);
@@ -922,6 +965,7 @@
             flashStatus.textContent = `Writing to flash… ${pct}%`;
           },
         });
+        firmwareWritten = true;
 
         flashStatus.innerHTML = `<span class="status-badge badge-ok">✓ Flash complete</span>`;
         flashBtn.innerHTML = `✓ Flashed`;
@@ -986,11 +1030,11 @@
         espLog('[info]: Device confirmed /config.json after reboot');
 
       } catch (e) {
-        const target = step3.classList.contains('active') ? provisionStatus : flashStatus;
+        const target = firmwareWritten ? provisionStatus : flashStatus;
         target.innerHTML = `<span class="status-badge badge-err">✗ ${e.message}</span>`;
-        flashBtn.disabled = false;
-        flashBtn.innerHTML = `⚡ Flash firmware`;
-        retryProvisionBtn.disabled = false;
+        flashBtn.disabled = firmwareWritten;
+        if (!firmwareWritten) flashBtn.innerHTML = `⚡ Flash firmware`;
+        retryProvisionBtn.disabled = !firmwareWritten;
         espLog(`Error: ${e.message}`, 'serial-line-error');
       }
     });
