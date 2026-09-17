@@ -907,6 +907,7 @@
 
         await writer.write(encoder.encode(command));
         espLog('[sent configuration to device]');
+        espLog('[info]: Waiting for IOTWX_CONFIG_OK');
         // If READY arrived before the status reply, that older reply can
         // appear here. A truncated probe from boot may also yield
         // UNKNOWN_COMMAND. Neither is proof that the configuration write was
@@ -918,6 +919,7 @@
         espLog('[info]: Device accepted configuration and is rebooting');
 
         // Wait for the firmware's next startup before requesting verification.
+        espLog('[info]: Waiting for ESP32 provisioning firmware after reboot');
         await waitForEsp32Response(reader, state, 'IOTWX_PROVISION_READY', 15000);
         await writer.write(encoder.encode('IOTWX_CONFIG_STATUS\n'));
         espLog('[sent configuration status request]');
@@ -956,6 +958,9 @@
 
       flashBtn.disabled = true;
       retryProvisionBtn.disabled = true;
+      if (isGenericEsp32CamTest) {
+        espLog('[info]: ESP32-CAM flasher v14 (automatic serial retry enabled)');
+      }
       flashBtn.innerHTML = `<span class="spinner"></span> Loading firmware…`;
       flashStatus.textContent = 'Loading unchanged firmware images…';
       provisionStatus.textContent = '';
@@ -1048,7 +1053,26 @@
 
         provisionStatus.innerHTML = `<span class="status-badge badge-wait">⏳ Saving configuration to LittleFS…</span>`;
         espLog('[info]: Reconnecting for LittleFS configuration');
-        await provisionEsp32(device, config);
+        // Opening the USB programmer can reboot the CAM while the first
+        // command is being sent. A fresh serial connection is the same
+        // recovery that the manual Retry button performs; do it automatically
+        // for transient CAM errors without erasing or flashing a second time.
+        const maxProvisionAttempts = isGenericEsp32CamTest ? 3 : 1;
+        for (let attempt = 1; attempt <= maxProvisionAttempts; attempt++) {
+          try {
+            await provisionEsp32(device, config);
+            break;
+          } catch (provisionError) {
+            const transient = /UNKNOWN_COMMAND|Timed out waiting for|serial connection closed unexpectedly/i
+              .test(provisionError.message || '');
+            if (attempt === maxProvisionAttempts || !transient) throw provisionError;
+            espLog(`[warn]: Configuration attempt ${attempt} failed: ${provisionError.message}`,
+              'serial-line-warn');
+            espLog(`[info]: Retrying ESP32-CAM configuration without flashing again (${attempt + 1}/${maxProvisionAttempts})`);
+            provisionStatus.innerHTML = `<span class="status-badge badge-wait">⏳ Retrying configuration without flashing again…</span>`;
+            await delay(750 * attempt);
+          }
+        }
 
         provisionStatus.innerHTML = `<span class="status-badge badge-ok">✓ Configuration saved and verified</span>`;
         step3.classList.remove('active');
